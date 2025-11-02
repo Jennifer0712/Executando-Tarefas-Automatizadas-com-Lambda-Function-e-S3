@@ -1,0 +1,136 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Parameters:
+  NomeBaseUnico:
+    Type: String
+    Default: hotelaria-processador-txt
+
+Resources:
+  BucketDestino:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${NomeBaseUnico}-processados
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  LambdaS3Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${NomeBaseUnico}-lambda-s3-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: 'arn:aws:logs:*:*:*'
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub arn:aws:s3:::${NomeBaseUnico}-originais/*
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub arn:aws:s3:::${BucketDestino}/*
+
+  FuncaoProcessadora:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${NomeBaseUnico}-funcao-processadora
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaS3Role.Arn
+      Runtime: python3.9
+      Timeout: 10
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import urllib.parse
+          import os 
+
+          s3 = boto3.client('s3')
+          BUCKET_DESTINO = os.environ['BUCKET_DESTINO']
+
+          def lambda_handler(event, context):
+              
+              print("Evento recebido:", json.dumps(event))
+              
+              bucket_origem = event['Records'][0]['s3']['bucket']['name']
+              key_origem = event['Records'][0]['s3']['object']['key']
+              key_origem = urllib.parse.unquote_plus(key_origem)
+              
+              print(f"Arquivo {key_origem} recebido do bucket {bucket_origem}")
+
+              try:
+                  response = s3.get_object(Bucket=bucket_origem, Key=key_origem)
+                  conteudo = response['Body'].read().decode('utf-8')
+                  conteudo_processado = conteudo.upper()
+                  key_destino = f"processado-{key_origem}"
+                  
+                  s3.put_object(
+                      Bucket=BUCKET_DESTINO,
+                      Key=key_destino,
+                      Body=conteudo_processado,
+                      ContentType='text/plain'
+                  )
+                  
+                  print(f"Sucesso! Arquivo salvo em {BUCKET_DESTINO}/{key_destino}")
+                  return {'status': 'success'}
+              
+              except Exception as e:
+                  print(f"Erro: {str(e)}")
+                  raise e
+      
+      Environment:
+        Variables:
+          BUCKET_DESTINO: !Ref BucketDestino
+
+  PermissaoS3InvocarLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt FuncaoProcessadora.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub arn:aws:s3:::${NomeBaseUnico}-originais
+      SourceAccount: !Ref AWS::AccountId
+
+  BucketOrigem:
+    Type: AWS::S3::Bucket
+    DependsOn:
+      - PermissaoS3InvocarLambda
+    Properties:
+      BucketName: !Sub ${NomeBaseUnico}-originais
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .txt
+            Function: !GetAtt FuncaoProcessadora.Arn
+
+Outputs:
+  BucketOrigemNome:
+    Description: Nome do bucket para fazer upload
+    Value: !Ref BucketOrigem
+  BucketDestinoNome:
+    Description: Nome do bucket para arquivos processados
+    Value: !Ref BucketDestino
